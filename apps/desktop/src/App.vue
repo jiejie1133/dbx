@@ -112,6 +112,7 @@ import { buildEditableObjectSource } from "@/lib/table/objectSourceEditor";
 import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
 import { oracleTypeManagementRequest } from "@/lib/table/oracleTypeManagementRequest";
 import { saveObjectSourceTab } from "@/lib/table/objectSourceTabSave";
+import { saveRoutineDefinitionToDatabase } from "@/lib/table/routineDefinitionSave";
 import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
 import { schemaAfterConnectionSwitch } from "@/lib/schema/connectionSchemaInitialization";
 import { canReuseTabForHistoryRestore, resolveHistorySqlRestoreTarget } from "@/lib/history/historyRestoreTarget";
@@ -193,6 +194,7 @@ import { createModifierDoubleTapShortcutController, isModifierDoubleTapShortcut,
 import { createTabSwitcherKeyboardController } from "@/lib/tabs/tabSwitcherKeyboard";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { isShortcutEditingKeydown, isShortcutEditingTarget } from "@/lib/editor/shortcutRecorder";
+import { registerCopyActiveResultShortcut } from "@/lib/editor/queryActiveResultShortcut";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
 import { aiSqlActionFeedback, type AiSqlActionOutcome, type AiSqlActionReport } from "@/lib/ai/aiSqlActionFeedback";
@@ -1220,6 +1222,23 @@ function requestActiveEditorExecuteAll(_source?: "pointer" | "keyboard", tabId?:
   void tryExecute(tab?.sql ?? undefined, targetTabId ? { tabId: targetTabId } : undefined);
 }
 
+const pendingRoutineSaves = new Set<string>();
+async function saveRoutineToDatabase(tabId: string) {
+  const tab = queryStore.tabs.find((item) => item.id === tabId);
+  const connection = tab && connectionStore.getConfig(tab.connectionId);
+  if (!tab || !connection || pendingRoutineSaves.has(tabId)) return;
+  const sql = contentAreaRef.value?.captureQueryEditorExecutionSnapshot?.(tabId)?.fullSql ?? tab.sql;
+  pendingRoutineSaves.add(tabId);
+  try {
+    const result = await saveRoutineDefinitionToDatabase(tab, sql, { connection, tabs: queryStore.tabs, execute: tryExecute, isCurrent: () => queryStore.tabs.includes(tab) && connectionStore.getConfig(tab.connectionId) === connection });
+    if (result?.status === "started" && result.ok) toast(t("objects.sourceSaved"), 2000);
+  } catch (error: unknown) {
+    toast(t("objects.sourceSaveFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
+  } finally {
+    pendingRoutineSaves.delete(tabId);
+  }
+}
+
 function requestActiveEditorExecuteInNewResultTab(source?: "pointer" | "keyboard", tabId?: string) {
   const snapshot = pendingToolbarExecutionSnapshot.value;
   pendingToolbarExecutionSnapshot.value = undefined;
@@ -1288,6 +1307,7 @@ provide(EDITOR_TOOLBAR_ACTIONS, {
   compressSql: compressActiveSql,
   toggleSqlKeywordCase,
   saveSql: (tabId: string) => void openSaveSqlDialog(tabId),
+  saveRoutineToDatabase: (tabId: string) => void saveRoutineToDatabase(tabId),
   saveAllTabs: (tabIds?: string[]) => void handleSaveAllTabs(tabIds),
   openSqlFile,
   importResultArchive,
@@ -5264,6 +5284,8 @@ watch(
   { immediate: true },
 );
 
+let unregisterCopyActiveResultShortcut: (() => void) | undefined;
+
 onMounted(async () => {
   clearStartupPreloadRetry();
   markStartupPhase("app-mounted");
@@ -5295,6 +5317,11 @@ onMounted(async () => {
   window.addEventListener("keydown", handleGlobalSearchKeydownCapture, true);
   window.addEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.addEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
+  unregisterCopyActiveResultShortcut = registerCopyActiveResultShortcut(() => ({
+    enabled: !showTabSwitcher.value && activeTab.value?.mode === "query" && !showSettingsPage.value && !showPluginCenter.value && !showDriverStore.value && !showConnectionDialog.value && (workspaceRendered() || isZenMode.value),
+    shortcuts: normalizeShortcutSettings(settingsStore.editorSettings.shortcuts),
+    copyActiveResult: () => contentAreaRef.value?.copyActiveResult() ?? false,
+  }));
   window.addEventListener("keydown", handleKeydown);
   window.addEventListener(DETACH_TAB_REQUEST_EVENT, handleDetachTabRequest as EventListener);
   window.addEventListener(DBX_VIM_ACTION_EVENT, handleVimDbxAppAction);
@@ -5398,6 +5425,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleGlobalSearchKeydownCapture, true);
   window.removeEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.removeEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
+  unregisterCopyActiveResultShortcut?.();
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener(DBX_VIM_ACTION_EVENT, handleVimDbxAppAction);
   window.removeEventListener("keyup", handleKeyup, true);
